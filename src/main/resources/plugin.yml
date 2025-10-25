@@ -4,3 +4,5 @@ main: com.optitem.OptItemPlugin
 description: Caches and restores NBT-heavy items efficiently to reduce lag and memory usage.
 author: v0ee
 api-version: "1.20"
+softdepend:
+  - ProtocolLib

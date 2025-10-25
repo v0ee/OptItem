@@ -254,6 +254,30 @@ public class NBTCacheManager {
         }
     }
 
+    public Optional<ItemStack> createClientViewStack(ItemStack placeholder) {
+        if (placeholder == null || placeholder.getType() == Material.AIR) {
+            return Optional.empty();
+        }
+
+        try {
+            ItemStack template = placeholder.clone();
+            NBTItem nbtItem = new NBTItem(template);
+            if (!nbtItem.hasKey(CACHE_KEY)) {
+                return Optional.empty();
+            }
+
+            int hashKey = nbtItem.getInteger(CACHE_KEY);
+            CachedEntry entry = cache.get(hashKey);
+            if (entry == null) {
+                return Optional.empty();
+            }
+
+            return entry.createItemStack(template);
+        } catch (Exception ex) {
+            return Optional.empty();
+        }
+    }
+
     private static final class CachedEntry {
         private final String nbtSnapshot;
         private final Set<UUID> references = ConcurrentHashMap.newKeySet();
