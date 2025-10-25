@@ -25,7 +25,7 @@ public final class ItemListener implements Listener {
         cacheManager.handleItemSpawn(event.getEntity());
     }
 
-    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onEntityPickup(EntityPickupItemEvent event) {
         var restored = cacheManager.handleAttemptPickup(event.getItem());
         if (restored.isPresent()) {
@@ -33,7 +33,7 @@ public final class ItemListener implements Listener {
         }
     }
 
-    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onInventoryPickup(InventoryPickupItemEvent event) {
         var restored = cacheManager.handleAttemptPickup(event.getItem());
         if (restored.isPresent()) {
