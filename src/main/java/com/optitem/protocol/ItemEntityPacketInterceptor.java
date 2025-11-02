@@ -8,15 +8,18 @@ import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.reflect.EquivalentConverter;
 import com.comphenix.protocol.wrappers.BukkitConverters;
 import com.comphenix.protocol.wrappers.WrappedDataValue;
-import com.comphenix.protocol.wrappers.WrappedDataWatcher;
 import com.optitem.cache.NBTCacheManager;
+import de.tr7zw.changeme.nbtapi.NBTItem;
+import org.bukkit.Material;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.Plugin;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
+@SuppressWarnings("deprecation")
 public final class ItemEntityPacketInterceptor {
 
     private static final int ITEM_STACK_DATA_INDEX = 8;
@@ -75,7 +78,8 @@ public final class ItemEntityPacketInterceptor {
                         continue;
                     }
 
-                    Object nmsStack = convertToNmsStack(clientStack.get());
+                    ItemStack sanitized = sanitizeForClient(clientStack.get());
+                    Object nmsStack = convertToNmsStack(sanitized);
                     if (nmsStack == null) {
                         updated.add(dataValue);
                         continue;
@@ -113,6 +117,42 @@ public final class ItemEntityPacketInterceptor {
             return itemStackConverter.getGeneric(stack);
         } catch (Exception ex) {
             return null;
+        }
+    }
+
+    private ItemStack sanitizeForClient(ItemStack original) {
+        if (original == null || original.getType() == Material.AIR) {
+            return original;
+        }
+
+        ItemStack working = original.clone();
+        working = cacheManager.sanitizeShulkerItem(working);
+        stripLore(working);
+        working = removeBlockEntityTag(working);
+        return working;
+    }
+
+    private void stripLore(ItemStack stack) {
+        ItemMeta meta = stack.getItemMeta();
+        if (meta == null || !meta.hasLore()) {
+            return;
+        }
+        meta.setLore(null);
+        stack.setItemMeta(meta);
+    }
+
+    private ItemStack removeBlockEntityTag(ItemStack stack) {
+        try {
+            NBTItem nbtItem = new NBTItem(stack.clone());
+            if (!nbtItem.hasKey("BlockEntityTag")) {
+                return stack;
+            }
+            nbtItem.removeKey("BlockEntityTag");
+            ItemStack sanitized = nbtItem.getItem();
+            sanitized.setAmount(stack.getAmount());
+            return sanitized;
+        } catch (Exception ex) {
+            return stack;
         }
     }
 

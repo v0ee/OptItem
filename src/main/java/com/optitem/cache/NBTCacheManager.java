@@ -5,6 +5,7 @@ import de.tr7zw.changeme.nbtapi.NBTItem;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Material;
+import org.bukkit.Tag;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.HumanEntity;
 import org.bukkit.entity.Item;
@@ -16,6 +17,8 @@ import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.BlockStateMeta;
+import org.bukkit.block.ShulkerBox;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
@@ -24,11 +27,13 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.nio.charset.StandardCharsets;
 
 @SuppressWarnings("deprecation")
 public class NBTCacheManager {
 
     private static final String CACHE_KEY = "CacheRef";
+    private static final int MAX_SHULKER_NBT_SIZE_BYTES = 200 * 1024;
 
     private final JavaPlugin plugin;
     private final long cleanupIntervalSeconds;
@@ -63,6 +68,12 @@ public class NBTCacheManager {
         ItemStack stack = item.getItemStack();
         if (stack == null || stack.getType() == Material.AIR) {
             return;
+        }
+
+        ItemStack sanitized = sanitizeShulkerItem(stack);
+        if (sanitized != stack) {
+            item.setItemStack(sanitized);
+            stack = sanitized;
         }
 
         ItemMeta meta = stack.getItemMeta();
@@ -140,6 +151,158 @@ public class NBTCacheManager {
             return;
         }
         plugin.getServer().getScheduler().runTask(plugin, () -> restoreInventoryContents(inventory));
+    }
+
+    public ItemStack sanitizeShulkerItem(ItemStack original) {
+        if (original == null || original.getType() == Material.AIR) {
+            return original;
+        }
+
+        Material type = original.getType();
+        if (!Tag.SHULKER_BOXES.isTagged(type)) {
+            return original;
+        }
+
+        try {
+            ItemStack working = original.clone();
+            NBTItem nbtItem = new NBTItem(working);
+            String serialized = nbtItem.toString();
+            if (serialized == null) {
+                return original;
+            }
+
+            int size = serialized.getBytes(StandardCharsets.UTF_8).length;
+            if (size <= MAX_SHULKER_NBT_SIZE_BYTES) {
+                return original;
+            }
+
+            ItemMeta meta = working.getItemMeta();
+            if (!(meta instanceof BlockStateMeta blockStateMeta)) {
+                return original;
+            }
+
+            if (!(blockStateMeta.getBlockState() instanceof ShulkerBox shulker)) {
+                return original;
+            }
+
+            boolean modified = sanitizeShulkerContents(shulker);
+            if (!modified) {
+                return original;
+            }
+
+            blockStateMeta.setBlockState(shulker);
+            working.setItemMeta(blockStateMeta);
+            working.setAmount(original.getAmount());
+            return working;
+        } catch (Exception ex) {
+            return original;
+        }
+    }
+
+    private boolean sanitizeShulkerContents(ShulkerBox shulker) {
+    boolean modified = false;
+    Inventory inventory = shulker.getInventory();
+        ItemStack[] contents = inventory.getContents();
+        for (int slot = 0; slot < contents.length; slot++) {
+            ItemStack content = contents[slot];
+            ItemStack trimmed = trimLargestTag(content);
+            if (trimmed != content) {
+                contents[slot] = trimmed;
+                modified = true;
+            }
+        }
+
+        if (modified) {
+            inventory.setContents(contents);
+        }
+        return modified;
+    }
+
+    private ItemStack trimLargestTag(ItemStack content) {
+        if (content == null || content.getType() == Material.AIR) {
+            return content;
+        }
+
+        try {
+            ItemStack base = content.clone();
+            NBTItem nbtItem = new NBTItem(base);
+            if (!nbtItem.hasNBTData()) {
+                return content;
+            }
+
+            Set<String> keys = nbtItem.getKeys();
+            if (keys.isEmpty()) {
+                return content;
+            }
+
+            int originalSize = estimateSizeBytes(nbtItem);
+            String targetKey = null;
+            int largestDelta = 0;
+
+            for (String key : keys) {
+                int delta;
+                if ("display".equals(key)) {
+                    ItemStack copyStack = content.clone();
+                    NBTItem copyNbt = new NBTItem(copyStack);
+                    var display = copyNbt.getCompound("display");
+                    if (display != null) {
+                        display.removeKey("Lore");
+                        display.removeKey("Name");
+                        if (display.getKeys().isEmpty()) {
+                            copyNbt.removeKey("display");
+                        }
+                        delta = originalSize - estimateSizeBytes(copyNbt);
+                    } else {
+                        delta = 0;
+                    }
+                } else {
+                    ItemStack copyStack = content.clone();
+                    NBTItem copyNbt = new NBTItem(copyStack);
+                    if (!copyNbt.hasKey(key)) {
+                        continue;
+                    }
+                    copyNbt.removeKey(key);
+                    delta = originalSize - estimateSizeBytes(copyNbt);
+                }
+
+                if (delta > largestDelta) {
+                    largestDelta = delta;
+                    targetKey = key;
+                }
+            }
+
+            if (targetKey == null || largestDelta <= 0) {
+                return content;
+            }
+
+            NBTItem editable = new NBTItem(base);
+            if ("display".equals(targetKey)) {
+                var display = editable.getCompound("display");
+                if (display != null) {
+                    display.removeKey("Lore");
+                    display.removeKey("Name");
+                    if (display.getKeys().isEmpty()) {
+                        editable.removeKey("display");
+                    }
+                }
+            } else {
+                editable.removeKey(targetKey);
+            }
+
+            ItemStack cleaned = editable.getItem();
+            cleaned.setAmount(content.getAmount());
+            return cleaned;
+        } catch (Exception ex) {
+            return content;
+        }
+    }
+
+    private int estimateSizeBytes(NBTItem item) {
+        String serialized = item.toString();
+        if (serialized == null) {
+            return 0;
+        }
+        return serialized.getBytes(StandardCharsets.UTF_8).length;
     }
 
     private boolean restoreItem(Item item, String reason) {
