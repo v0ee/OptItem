@@ -1,1 +1,4 @@
 cache-cleanup-interval-seconds: 60
+max-shulker-nbt-bytes: 204800
+player-quit-restore-radius: 32.0
+debug-logging: false

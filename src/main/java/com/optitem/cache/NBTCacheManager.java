@@ -6,6 +6,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Material;
 import org.bukkit.Tag;
+import org.bukkit.Location;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.HumanEntity;
 import org.bukkit.entity.Item;
@@ -33,19 +34,22 @@ import java.nio.charset.StandardCharsets;
 public class NBTCacheManager {
 
     private static final String CACHE_KEY = "CacheRef";
-    private static final int MAX_SHULKER_NBT_SIZE_BYTES = 200 * 1024;
-
     private final JavaPlugin plugin;
     private final long cleanupIntervalSeconds;
+    private final int maxShulkerNbtSizeBytes;
+    private final boolean debugLogging;
 
     private final ConcurrentHashMap<Integer, CachedEntry> cache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Integer> entityIndex = new ConcurrentHashMap<>();
 
     private BukkitTask cleanupTask;
 
-    public NBTCacheManager(JavaPlugin plugin, long cleanupIntervalSeconds) {
+    public NBTCacheManager(JavaPlugin plugin, long cleanupIntervalSeconds, int maxShulkerNbtSizeBytes,
+            boolean debugLogging) {
         this.plugin = plugin;
         this.cleanupIntervalSeconds = cleanupIntervalSeconds;
+        this.maxShulkerNbtSizeBytes = Math.max(1024, maxShulkerNbtSizeBytes);
+        this.debugLogging = debugLogging;
     }
 
     public void start() {
@@ -153,6 +157,30 @@ public class NBTCacheManager {
         plugin.getServer().getScheduler().runTask(plugin, () -> restoreInventoryContents(inventory));
     }
 
+    public void restoreItemsNear(Location location, double radius) {
+        if (location == null || radius <= 0) {
+            return;
+        }
+
+        double radiusSquared = radius * radius;
+        List<UUID> tracked = List.copyOf(entityIndex.keySet());
+        for (UUID uuid : tracked) {
+            Entity entity = Bukkit.getEntity(uuid);
+            if (!(entity instanceof Item item)) {
+                continue;
+            }
+            if (!item.getWorld().equals(location.getWorld())) {
+                continue;
+            }
+            if (item.getLocation().distanceSquared(location) > radiusSquared) {
+                continue;
+            }
+            if (restoreItem(item, "player-quit")) {
+                debug("Restored cached item near player quit at %s", location);
+            }
+        }
+    }
+
     public ItemStack sanitizeShulkerItem(ItemStack original) {
         if (original == null || original.getType() == Material.AIR) {
             return original;
@@ -172,7 +200,7 @@ public class NBTCacheManager {
             }
 
             int size = serialized.getBytes(StandardCharsets.UTF_8).length;
-            if (size <= MAX_SHULKER_NBT_SIZE_BYTES) {
+            if (size <= maxShulkerNbtSizeBytes) {
                 return original;
             }
 
@@ -193,6 +221,7 @@ public class NBTCacheManager {
             blockStateMeta.setBlockState(shulker);
             working.setItemMeta(blockStateMeta);
             working.setAmount(original.getAmount());
+            debug("Trimmed shulker NBT (%d bytes) for item %s", size, describeItem(original));
             return working;
         } catch (Exception ex) {
             return original;
@@ -200,8 +229,8 @@ public class NBTCacheManager {
     }
 
     private boolean sanitizeShulkerContents(ShulkerBox shulker) {
-    boolean modified = false;
-    Inventory inventory = shulker.getInventory();
+        boolean modified = false;
+        Inventory inventory = shulker.getInventory();
         ItemStack[] contents = inventory.getContents();
         for (int slot = 0; slot < contents.length; slot++) {
             ItemStack content = contents[slot];
@@ -214,6 +243,7 @@ public class NBTCacheManager {
 
         if (modified) {
             inventory.setContents(contents);
+            debug("Sanitized contents of shulker box; %d slots adjusted", contents.length);
         }
         return modified;
     }
@@ -291,6 +321,7 @@ public class NBTCacheManager {
 
             ItemStack cleaned = editable.getItem();
             cleaned.setAmount(content.getAmount());
+            debug("Removed NBT tag '%s' from shulker content (%d bytes saved)", targetKey, largestDelta);
             return cleaned;
         } catch (Exception ex) {
             return content;
@@ -334,6 +365,7 @@ public class NBTCacheManager {
         item.setItemStack(restored.get());
         entry.removeReference(item.getUniqueId());
         entityIndex.remove(item.getUniqueId());
+        debug("Applied cached NBT to item %s (%s) for %s", item.getUniqueId(), describeItem(restored.get()), reason);
 
         return true;
     }
@@ -373,7 +405,9 @@ public class NBTCacheManager {
         for (UUID uuid : tracked) {
             Entity entity = Bukkit.getEntity(uuid);
             if (entity instanceof Item item) {
-                restoreItem(item, reason);
+                if (restoreItem(item, reason)) {
+                    debug("Restored tracked item %s for %s", uuid, reason);
+                }
             }
         }
     }
@@ -439,6 +473,30 @@ public class NBTCacheManager {
         } catch (Exception ex) {
             return Optional.empty();
         }
+    }
+
+    public boolean isDebugLogging() {
+        return debugLogging;
+    }
+
+    public void debug(String message, Object... args) {
+        if (!debugLogging) {
+            return;
+        }
+        String formatted = args.length == 0 ? message : String.format(message, args);
+        plugin.getLogger().info("[Debug] " + formatted);
+    }
+
+    private String describeItem(ItemStack stack) {
+        if (stack == null) {
+            return "null";
+        }
+        String base = stack.getType().name() + "x" + stack.getAmount();
+        ItemMeta meta = stack.getItemMeta();
+        if (meta != null && meta.hasDisplayName()) {
+            return base + " (" + meta.getDisplayName() + ")";
+        }
+        return base;
     }
 
     private static final class CachedEntry {

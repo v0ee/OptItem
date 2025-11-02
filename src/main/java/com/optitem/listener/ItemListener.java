@@ -11,13 +11,16 @@ import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.ItemSpawnEvent;
 import org.bukkit.event.inventory.InventoryPickupItemEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 
 public final class ItemListener implements Listener {
 
     private final NBTCacheManager cacheManager;
+    private final double playerQuitRestoreRadius;
 
-    public ItemListener(NBTCacheManager cacheManager) {
+    public ItemListener(NBTCacheManager cacheManager, double playerQuitRestoreRadius) {
         this.cacheManager = cacheManager;
+        this.playerQuitRestoreRadius = Math.max(0D, playerQuitRestoreRadius);
     }
 
     @EventHandler(priority = EventPriority.NORMAL, ignoreCancelled = true)
@@ -52,6 +55,13 @@ public final class ItemListener implements Listener {
     public void onChunkUnload(ChunkUnloadEvent event) {
         Chunk chunk = event.getChunk();
         cacheManager.handleChunkUnload(chunk);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        cacheManager.debug("Player %s quit; restoring items within %.1f blocks", event.getPlayer().getName(),
+                playerQuitRestoreRadius);
+        cacheManager.restoreItemsNear(event.getPlayer().getLocation(), playerQuitRestoreRadius);
     }
 
 }

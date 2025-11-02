@@ -26,12 +26,14 @@ public final class ItemEntityPacketInterceptor {
 
     private final Plugin plugin;
     private final NBTCacheManager cacheManager;
+    private final boolean debugLogging;
     private final EquivalentConverter<ItemStack> itemStackConverter = BukkitConverters.getItemStackConverter();
     private PacketAdapter listener;
 
-    public ItemEntityPacketInterceptor(Plugin plugin, NBTCacheManager cacheManager) {
+    public ItemEntityPacketInterceptor(Plugin plugin, NBTCacheManager cacheManager, boolean debugLogging) {
         this.plugin = plugin;
         this.cacheManager = cacheManager;
+        this.debugLogging = debugLogging;
     }
 
     public void register() {
@@ -59,6 +61,7 @@ public final class ItemEntityPacketInterceptor {
 
                 List<WrappedDataValue> updated = new ArrayList<>(dataValues.size());
                 boolean modified = false;
+                int sanitizedEntries = 0;
 
                 for (WrappedDataValue dataValue : dataValues) {
                     if (dataValue == null || dataValue.getIndex() != ITEM_STACK_DATA_INDEX) {
@@ -91,10 +94,14 @@ public final class ItemEntityPacketInterceptor {
                             nmsStack);
                     updated.add(replacement);
                     modified = true;
+                    sanitizedEntries++;
                 }
 
                 if (modified) {
                     event.getPacket().getDataValueCollectionModifier().write(0, updated);
+                    String target = event.getPlayer() != null ? event.getPlayer().getName() : "unknown-player";
+                    ItemEntityPacketInterceptor.this.debug("Sanitized %d metadata entries for %s", sanitizedEntries,
+                            target);
                 }
             }
         };
@@ -168,5 +175,13 @@ public final class ItemEntityPacketInterceptor {
         } catch (Exception ex) {
             return null;
         }
+    }
+
+    private void debug(String message, Object... args) {
+        if (!debugLogging) {
+            return;
+        }
+        String formatted = args.length == 0 ? message : String.format(message, args);
+        plugin.getLogger().info("[Debug] " + formatted);
     }
 }
