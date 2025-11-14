@@ -2,6 +2,8 @@ package com.optitem.cache;
 
 import de.tr7zw.changeme.nbtapi.NBTContainer;
 import de.tr7zw.changeme.nbtapi.NBTItem;
+import de.tr7zw.changeme.nbtapi.iface.ReadWriteNBT;
+import de.tr7zw.changeme.nbtapi.iface.ReadWriteNBTList;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Material;
@@ -16,33 +18,58 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.EntityEquipment;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
-import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.ItemMeta;
-import org.bukkit.inventory.meta.BlockStateMeta;
-import org.bukkit.block.ShulkerBox;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Optional;
+import java.util.Queue;
+import java.util.Collections;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.TimeUnit;
 import java.nio.charset.StandardCharsets;
 
 @SuppressWarnings("deprecation")
 public class NBTCacheManager {
 
     private static final String CACHE_KEY = "CacheRef";
+    private static final List<String> PRIORITY_TRIM_KEYS = List.of(
+            "SkullOwner",
+            "EntityTag",
+            "BlockEntityTag",
+            "Enchantments",
+            "StoredEnchantments",
+            "AttributeModifiers",
+            "CustomModelData");
     private final JavaPlugin plugin;
     private final long cleanupIntervalSeconds;
     private final int maxShulkerNbtSizeBytes;
     private final boolean debugLogging;
 
-    private final ConcurrentHashMap<Integer, CachedEntry> cache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UUID, Integer> entityIndex = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Integer, CachedEntry> cache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, Integer> entityIndex = new ConcurrentHashMap<>();
+    private final Queue<ItemSpawnRequest> pendingSpawnQueue = new ConcurrentLinkedQueue<>();
+    private final int asyncProcessBaseLimit = 25;
+    private final int asyncProcessBurstLimit = 150;
+    private final long asyncProcessTimeBudgetNanos = TimeUnit.MILLISECONDS.toNanos(8);
+    private final AtomicInteger pendingSpawnCount = new AtomicInteger();
+    private final AtomicBoolean acceptingWork = new AtomicBoolean(true);
+    private final int maxPendingSpawn = 512;
+    private final long cleanupGracePeriodNanos = TimeUnit.MILLISECONDS.toNanos(1500);
 
     private BukkitTask cleanupTask;
+    private BukkitTask asyncWorkerTask;
 
     public NBTCacheManager(JavaPlugin plugin, long cleanupIntervalSeconds, int maxShulkerNbtSizeBytes,
             boolean debugLogging) {
@@ -54,13 +81,23 @@ public class NBTCacheManager {
 
     public void start() {
         long intervalTicks = Math.max(20L, cleanupIntervalSeconds * 20L);
+        acceptingWork.set(true);
+        pendingSpawnCount.set(0);
         cleanupTask = plugin.getServer().getScheduler().runTaskTimer(plugin, () -> cleanup("scheduled"), intervalTicks,
                 intervalTicks);
+        asyncWorkerTask = plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::drainSpawnQueue,
+                1L, 1L);
     }
 
     public void shutdown() {
+        acceptingWork.set(false);
+        pendingSpawnQueue.clear();
+        pendingSpawnCount.set(0);
         if (cleanupTask != null) {
             cleanupTask.cancel();
+        }
+        if (asyncWorkerTask != null) {
+            asyncWorkerTask.cancel();
         }
         restoreTrackedItems("shutdown");
         cleanup("shutdown");
@@ -74,44 +111,331 @@ public class NBTCacheManager {
             return;
         }
 
-        ItemStack sanitized = sanitizeShulkerItem(stack);
-        if (sanitized != stack) {
-            item.setItemStack(sanitized);
-            stack = sanitized;
+        if (!acceptingWork.get()) {
+            return;
         }
 
         ItemMeta meta = stack.getItemMeta();
+        boolean hasDisplayName = meta != null && meta.hasDisplayName();
         boolean hasLore = meta != null && meta.hasLore();
+        boolean hasEnchantments = !stack.getEnchantments().isEmpty();
+        boolean isShulker = Tag.SHULKER_BOXES.isTagged(stack.getType());
 
-        NBTItem nbtItem = new NBTItem(stack);
-        if (!hasLore && !nbtItem.hasNBTData()) {
+        if (!hasDisplayName && !hasLore && !hasEnchantments && !isShulker) {
             return;
         }
 
-        if (nbtItem.hasKey(CACHE_KEY)) {
+        if (pendingSpawnCount.incrementAndGet() > maxPendingSpawn) {
+            pendingSpawnCount.decrementAndGet();
             return;
         }
 
-        String serialized = nbtItem.toString();
-        if (serialized == null || serialized.isEmpty()) {
+        ItemStack snapshot = stack.clone();
+        ItemSpawnRequest request = new ItemSpawnRequest(item.getUniqueId(), snapshot,
+                hasLore, isShulker, describeItem(stack));
+        pendingSpawnQueue.offer(request);
+    }
+
+    private void drainSpawnQueue() {
+        if (!acceptingWork.get()) {
             return;
         }
 
-        int hashKey = serialized.hashCode();
+        long start = System.nanoTime();
+        int queueSize = pendingSpawnCount.get();
+        int dynamicLimit = Math.min(asyncProcessBurstLimit,
+                Math.max(asyncProcessBaseLimit, queueSize / 2));
 
-        CachedEntry entry = cache.compute(hashKey,
-                (key, existing) -> existing == null ? new CachedEntry(serialized) : existing);
+        int processed = 0;
+        ItemSpawnRequest request;
+        while (acceptingWork.get() && processed < dynamicLimit && (request = pendingSpawnQueue.poll()) != null) {
+            releasePendingSlot();
+            processSpawnRequestAsync(request);
+            processed++;
+            if ((processed & 7) == 0 && System.nanoTime() - start >= asyncProcessTimeBudgetNanos) {
+                break;
+            }
+        }
 
+        if (!pendingSpawnQueue.isEmpty() && acceptingWork.get()) {
+            plugin.getServer().getScheduler().runTaskAsynchronously(plugin, this::drainSpawnQueue);
+        }
+    }
+
+    private void releasePendingSlot() {
+        int current = pendingSpawnCount.decrementAndGet();
+        if (current < 0) {
+            pendingSpawnCount.set(0);
+        }
+    }
+
+    private void processSpawnRequestAsync(ItemSpawnRequest request) {
+        if (!acceptingWork.get()) {
+            return;
+        }
+        Optional<ProcessedItem> processed = buildProcessedItem(request);
+        if (processed.isPresent()) {
+            ProcessedItem result = processed.get();
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                try {
+                    applyProcessedItem(result);
+                } catch (Exception ex) {
+                    debug("Failed to apply cached item %s: %s", request.entityId, ex.getMessage());
+                    handleProcessingFailure(request);
+                }
+            });
+        } else {
+            handleProcessingFailure(request);
+        }
+    }
+
+    private void handleProcessingFailure(ItemSpawnRequest request) {
+        plugin.getServer().getScheduler().runTask(plugin, () -> {
+            Entity entity = Bukkit.getEntity(request.entityId);
+            if (!(entity instanceof Item item)) {
+                return;
+            }
+            ItemStack fallback = request.snapshot == null ? null : request.snapshot.clone();
+            if (fallback != null) {
+                item.setItemStack(fallback);
+            }
+            removeReference(item.getUniqueId());
+        });
+    }
+
+    private Optional<ProcessedItem> buildProcessedItem(ItemSpawnRequest request) {
+        try {
+            NBTItem nbtItem = new NBTItem(request.snapshot);
+            if (nbtItem.hasKey(CACHE_KEY)) {
+                return Optional.empty();
+            }
+
+            String initialSerialized = nbtItem.toString();
+            if (initialSerialized == null || initialSerialized.isEmpty()) {
+                return Optional.empty();
+            }
+
+            int initialSizeBytes = estimateSizeBytes(initialSerialized);
+
+            List<String> debugMessages = new ArrayList<>();
+            boolean sanitized = false;
+
+            if (request.shulker) {
+                if (initialSizeBytes > maxShulkerNbtSizeBytes) {
+                    sanitized = sanitizeShulkerItem(nbtItem, debugMessages, initialSizeBytes, request.description);
+                }
+            }
+
+            if (!request.hasLore && !nbtItem.hasNBTData()) {
+                return Optional.empty();
+            }
+
+            String serialized = sanitized ? nbtItem.toString() : initialSerialized;
+            if (serialized == null || serialized.isEmpty()) {
+                return Optional.empty();
+            }
+
+            int signature = sum(serialized);
+            return Optional.of(new ProcessedItem(request, serialized, signature, sanitized, debugMessages));
+        } catch (Exception ex) {
+            return Optional.empty();
+        }
+    }
+
+    private void applyProcessedItem(ProcessedItem processed) {
+        Entity entity = Bukkit.getEntity(processed.request.entityId);
+        if (!(entity instanceof Item item)) {
+            return;
+        }
+
+        ItemStack base = item.getItemStack();
+        if (base == null || base.getType() == Material.AIR) {
+            return;
+        }
+
+        ItemStack sanitized = applySnapshotToTemplate(base, processed.serializedSnapshot);
+
+        CachedEntry entry = cache.compute(processed.signature,
+                (key, existing) -> existing == null ? new CachedEntry(processed.serializedSnapshot, sanitized)
+                        : existing);
         if (entry == null) {
             return;
         }
 
         entry.addReference(item.getUniqueId());
-        entityIndex.put(item.getUniqueId(), hashKey);
+        entityIndex.put(item.getUniqueId(), processed.signature);
 
-        ItemStack placeholder = createPlaceholderStack(stack, hashKey);
+        if (processed.sanitized) {
+            item.setItemStack(sanitized.clone());
+        }
+
+        ItemStack placeholder = createPlaceholderStack(sanitized, processed.signature);
         item.setItemStack(placeholder);
 
+        if (!processed.debugMessages.isEmpty()) {
+            for (String message : processed.debugMessages) {
+                debug(message);
+            }
+        }
+    }
+
+    private boolean sanitizeShulkerItem(NBTItem nbtItem, List<String> debugMessages, int originalSize,
+            String description) {
+        boolean modified = sanitizeShulkerContents(nbtItem, debugMessages);
+        if (modified && description != null) {
+            debugMessages.add(String.format("Trimmed shulker NBT (%d bytes) for item %s", originalSize, description));
+        }
+        return modified;
+    }
+
+    private boolean sanitizeShulkerContents(NBTItem nbtItem, List<String> debugMessages) {
+        ReadWriteNBT blockEntity = nbtItem.getCompound("BlockEntityTag");
+        if (blockEntity == null) {
+            return false;
+        }
+        @SuppressWarnings("unchecked")
+        ReadWriteNBTList<ReadWriteNBT> items = (ReadWriteNBTList<ReadWriteNBT>) blockEntity.getCompoundList("Items");
+        if (items == null || items.isEmpty()) {
+            return false;
+        }
+
+        boolean modified = false;
+        int adjusted = 0;
+        for (ReadWriteNBT itemCompound : items) {
+            if (itemCompound == null) {
+                continue;
+            }
+            if (trimLargestTag(itemCompound, debugMessages)) {
+                modified = true;
+                adjusted++;
+            }
+        }
+
+        if (modified) {
+            debugMessages.add(String.format("Sanitized contents of shulker box; %d slots adjusted", adjusted));
+        }
+        return modified;
+    }
+
+    private boolean trimLargestTag(ReadWriteNBT itemCompound, List<String> debugMessages) {
+        ReadWriteNBT tag = itemCompound.getCompound("tag");
+        if (tag == null) {
+            return false;
+        }
+        Set<String> keys = tag.getKeys();
+        if (keys.isEmpty()) {
+            return false;
+        }
+
+        int originalSize = estimateSizeBytes(itemCompound.toString());
+        String targetKey = null;
+        int largestDelta = 0;
+
+        List<String> orderedCandidates = new ArrayList<>();
+        for (String priority : PRIORITY_TRIM_KEYS) {
+            if (keys.contains(priority)) {
+                orderedCandidates.add(priority);
+            }
+        }
+        if (orderedCandidates.isEmpty()) {
+            int inspected = 0;
+            for (String key : keys) {
+                orderedCandidates.add(key);
+                if (++inspected >= 3) {
+                    break;
+                }
+            }
+        }
+
+        for (String key : orderedCandidates) {
+            int delta = computeTagRemovalDelta(itemCompound, key, originalSize);
+            if (delta > largestDelta) {
+                largestDelta = delta;
+                targetKey = key;
+            }
+        }
+
+        if (targetKey == null || largestDelta <= 0) {
+            return false;
+        }
+
+        if ("display".equals(targetKey)) {
+            ReadWriteNBT display = tag.getCompound("display");
+            if (display != null) {
+                display.removeKey("Lore");
+                display.removeKey("Name");
+                if (display.getKeys().isEmpty()) {
+                    tag.removeKey("display");
+                }
+            }
+        } else {
+            tag.removeKey(targetKey);
+        }
+
+        if (tag.getKeys().isEmpty()) {
+            itemCompound.removeKey("tag");
+        }
+
+        debugMessages.add(String.format("Removed NBT tag '%s' from shulker content (%d bytes saved)", targetKey,
+                largestDelta));
+        return true;
+    }
+
+    private int computeTagRemovalDelta(ReadWriteNBT itemCompound, String key, int originalSize) {
+        try {
+            NBTContainer copy = new NBTContainer(itemCompound.toString());
+            ReadWriteNBT copyTag = copy.getCompound("tag");
+            if (copyTag == null) {
+                return 0;
+            }
+            if ("display".equals(key)) {
+                ReadWriteNBT display = copyTag.getCompound("display");
+                if (display == null) {
+                    return 0;
+                }
+                display.removeKey("Lore");
+                display.removeKey("Name");
+                if (display.getKeys().isEmpty()) {
+                    copyTag.removeKey("display");
+                }
+            } else {
+                if (!copyTag.getKeys().contains(key)) {
+                    return 0;
+                }
+                copyTag.removeKey(key);
+            }
+            if (copyTag.getKeys().isEmpty()) {
+                copy.removeKey("tag");
+            }
+            int newSize = estimateSizeBytes(copy.toString());
+            return originalSize - newSize;
+        } catch (Exception ex) {
+            return 0;
+        }
+    }
+
+    private ItemStack applySnapshotToTemplate(ItemStack template, String serialized) {
+        if (template == null) {
+            return null;
+        }
+        ItemStack merged = template.clone();
+        try {
+            NBTContainer container = new NBTContainer(serialized);
+            stripIdentityKeys(container);
+            NBTItem nbtItem = new NBTItem(merged);
+            nbtItem.mergeCompound(container);
+            nbtItem.removeKey(CACHE_KEY);
+            return nbtItem.getItem();
+        } catch (Exception ex) {
+            return merged;
+        }
+    }
+
+    private int estimateSizeBytes(String serialized) {
+        if (serialized == null || serialized.isEmpty()) {
+            return 0;
+        }
+        return serialized.getBytes(StandardCharsets.UTF_8).length;
     }
 
     public Optional<ItemStack> handleAttemptPickup(Item item) {
@@ -122,13 +446,13 @@ public class NBTCacheManager {
     }
 
     public void handleChunkUnload(Chunk chunk) {
+        List<Item> items = new ArrayList<>();
         for (Entity entity : chunk.getEntities()) {
             if (entity instanceof Item item) {
-                if (!restoreItem(item, "chunk-unload")) {
-                    removeReference(item.getUniqueId());
-                }
+                items.add(item);
             }
         }
+        restoreItemsBulk(items, "chunk-unload");
     }
 
     public void handleEntityRemoval(Item item) {
@@ -199,141 +523,26 @@ public class NBTCacheManager {
                 return original;
             }
 
-            int size = serialized.getBytes(StandardCharsets.UTF_8).length;
+            int size = estimateSizeBytes(serialized);
             if (size <= maxShulkerNbtSizeBytes) {
                 return original;
             }
 
-            ItemMeta meta = working.getItemMeta();
-            if (!(meta instanceof BlockStateMeta blockStateMeta)) {
+            List<String> debugMessages = new ArrayList<>();
+            if (!sanitizeShulkerItem(nbtItem, debugMessages, size, describeItem(original))) {
                 return original;
             }
 
-            if (!(blockStateMeta.getBlockState() instanceof ShulkerBox shulker)) {
-                return original;
+            ItemStack sanitized = nbtItem.getItem();
+            if (!debugMessages.isEmpty()) {
+                for (String message : debugMessages) {
+                    debug(message);
+                }
             }
-
-            boolean modified = sanitizeShulkerContents(shulker);
-            if (!modified) {
-                return original;
-            }
-
-            blockStateMeta.setBlockState(shulker);
-            working.setItemMeta(blockStateMeta);
-            working.setAmount(original.getAmount());
-            debug("Trimmed shulker NBT (%d bytes) for item %s", size, describeItem(original));
-            return working;
+            return sanitized;
         } catch (Exception ex) {
             return original;
         }
-    }
-
-    private boolean sanitizeShulkerContents(ShulkerBox shulker) {
-        boolean modified = false;
-        Inventory inventory = shulker.getInventory();
-        ItemStack[] contents = inventory.getContents();
-        for (int slot = 0; slot < contents.length; slot++) {
-            ItemStack content = contents[slot];
-            ItemStack trimmed = trimLargestTag(content);
-            if (trimmed != content) {
-                contents[slot] = trimmed;
-                modified = true;
-            }
-        }
-
-        if (modified) {
-            inventory.setContents(contents);
-            debug("Sanitized contents of shulker box; %d slots adjusted", contents.length);
-        }
-        return modified;
-    }
-
-    private ItemStack trimLargestTag(ItemStack content) {
-        if (content == null || content.getType() == Material.AIR) {
-            return content;
-        }
-
-        try {
-            ItemStack base = content.clone();
-            NBTItem nbtItem = new NBTItem(base);
-            if (!nbtItem.hasNBTData()) {
-                return content;
-            }
-
-            Set<String> keys = nbtItem.getKeys();
-            if (keys.isEmpty()) {
-                return content;
-            }
-
-            int originalSize = estimateSizeBytes(nbtItem);
-            String targetKey = null;
-            int largestDelta = 0;
-
-            for (String key : keys) {
-                int delta;
-                if ("display".equals(key)) {
-                    ItemStack copyStack = content.clone();
-                    NBTItem copyNbt = new NBTItem(copyStack);
-                    var display = copyNbt.getCompound("display");
-                    if (display != null) {
-                        display.removeKey("Lore");
-                        display.removeKey("Name");
-                        if (display.getKeys().isEmpty()) {
-                            copyNbt.removeKey("display");
-                        }
-                        delta = originalSize - estimateSizeBytes(copyNbt);
-                    } else {
-                        delta = 0;
-                    }
-                } else {
-                    ItemStack copyStack = content.clone();
-                    NBTItem copyNbt = new NBTItem(copyStack);
-                    if (!copyNbt.hasKey(key)) {
-                        continue;
-                    }
-                    copyNbt.removeKey(key);
-                    delta = originalSize - estimateSizeBytes(copyNbt);
-                }
-
-                if (delta > largestDelta) {
-                    largestDelta = delta;
-                    targetKey = key;
-                }
-            }
-
-            if (targetKey == null || largestDelta <= 0) {
-                return content;
-            }
-
-            NBTItem editable = new NBTItem(base);
-            if ("display".equals(targetKey)) {
-                var display = editable.getCompound("display");
-                if (display != null) {
-                    display.removeKey("Lore");
-                    display.removeKey("Name");
-                    if (display.getKeys().isEmpty()) {
-                        editable.removeKey("display");
-                    }
-                }
-            } else {
-                editable.removeKey(targetKey);
-            }
-
-            ItemStack cleaned = editable.getItem();
-            cleaned.setAmount(content.getAmount());
-            debug("Removed NBT tag '%s' from shulker content (%d bytes saved)", targetKey, largestDelta);
-            return cleaned;
-        } catch (Exception ex) {
-            return content;
-        }
-    }
-
-    private int estimateSizeBytes(NBTItem item) {
-        String serialized = item.toString();
-        if (serialized == null) {
-            return 0;
-        }
-        return serialized.getBytes(StandardCharsets.UTF_8).length;
     }
 
     private boolean restoreItem(Item item, String reason) {
@@ -347,25 +556,25 @@ public class NBTCacheManager {
             return false;
         }
 
-        int hashKey = nbtItem.getInteger(CACHE_KEY);
-        CachedEntry entry = cache.get(hashKey);
+        int signature = nbtItem.getInteger(CACHE_KEY);
+        CachedEntry entry = cache.get(signature);
         if (entry == null) {
-            nbtItem.removeKey(CACHE_KEY);
-            item.setItemStack(nbtItem.getItem());
+            item.setItemStack(removeCacheKey(stack));
             removeReference(item.getUniqueId());
             return false;
         }
 
         Optional<ItemStack> restored = entry.createItemStack(stack);
         if (restored.isEmpty()) {
-            removeReference(item.getUniqueId());
+            item.setItemStack(removeCacheKey(stack));
+            removeReference(item.getUniqueId(), signature, entry);
             return false;
         }
 
-        item.setItemStack(restored.get());
-        entry.removeReference(item.getUniqueId());
-        entityIndex.remove(item.getUniqueId());
-        debug("Applied cached NBT to item %s (%s) for %s", item.getUniqueId(), describeItem(restored.get()), reason);
+        ItemStack restoredStack = restored.get();
+        item.setItemStack(restoredStack);
+        removeReference(item.getUniqueId(), signature, entry);
+        debug("Applied cached NBT to item %s (%s) for %s", item.getUniqueId(), describeItem(restoredStack), reason);
 
         return true;
     }
@@ -381,33 +590,99 @@ public class NBTCacheManager {
         }
     }
 
-    private ItemStack createPlaceholderStack(ItemStack original, int hashKey) {
-        ItemStack placeholder = new ItemStack(original.getType(), original.getAmount());
-        ItemMeta baseMeta = Bukkit.getItemFactory().getItemMeta(original.getType());
-        ItemMeta originalMeta = original.getItemMeta();
-        if (baseMeta != null && originalMeta instanceof Damageable originalDamage
-                && baseMeta instanceof Damageable baseDamage) {
-            baseDamage.setDamage(originalDamage.getDamage());
-            placeholder.setItemMeta(baseMeta);
+    private void removeReference(UUID entityId, int signature, CachedEntry entry) {
+        entityIndex.remove(entityId, signature);
+        if (entry != null) {
+            entry.removeReference(entityId);
+        }
+    }
+
+    private ItemStack createPlaceholderStack(ItemStack original, int signature) {
+        ItemStack placeholder = original == null ? null : original.clone();
+        if (placeholder == null) {
+            return null;
         }
 
         NBTItem nbtItem = new NBTItem(placeholder);
-        nbtItem.setInteger(CACHE_KEY, hashKey);
+        nbtItem.setInteger(CACHE_KEY, signature);
         return nbtItem.getItem();
     }
 
     private void cleanup(String reason) {
-        cache.entrySet().removeIf(entry -> entry.getValue().isOrphaned());
+        long cutoff = System.nanoTime() - cleanupGracePeriodNanos;
+        cache.entrySet().removeIf(entry -> entry.getValue().readyForCleanup(cutoff));
     }
 
     public void restoreTrackedItems(String reason) {
+        List<Item> items = new ArrayList<>();
         List<UUID> tracked = List.copyOf(entityIndex.keySet());
         for (UUID uuid : tracked) {
             Entity entity = Bukkit.getEntity(uuid);
             if (entity instanceof Item item) {
-                if (restoreItem(item, reason)) {
-                    debug("Restored tracked item %s for %s", uuid, reason);
+                items.add(item);
+            }
+        }
+        restoreItemsBulk(items, reason);
+    }
+
+    private void restoreItemsBulk(List<Item> items, String reason) {
+        if (items == null || items.isEmpty()) {
+            return;
+        }
+
+        HashMap<Integer, List<Item>> buckets = new HashMap<>();
+        for (Item item : items) {
+            if (item == null) {
+                continue;
+            }
+            ItemStack stack = item.getItemStack();
+            if (stack == null || stack.getType() == Material.AIR) {
+                continue;
+            }
+            try {
+                NBTItem nbtItem = new NBTItem(stack);
+                if (!nbtItem.hasKey(CACHE_KEY)) {
+                    continue;
                 }
+                int signature = nbtItem.getInteger(CACHE_KEY);
+                buckets.computeIfAbsent(signature, key -> new ArrayList<>()).add(item);
+            } catch (Exception ex) {
+                item.setItemStack(removeCacheKey(stack));
+                removeReference(item.getUniqueId());
+            }
+        }
+
+        for (Map.Entry<Integer, List<Item>> entry : buckets.entrySet()) {
+            int signature = entry.getKey();
+            CachedEntry cached = cache.get(signature);
+            if (cached == null) {
+                for (Item item : entry.getValue()) {
+                    ItemStack stack = item.getItemStack();
+                    item.setItemStack(removeCacheKey(stack));
+                    removeReference(item.getUniqueId(), signature, null);
+                }
+                continue;
+            }
+
+            for (Item item : entry.getValue()) {
+                ItemStack stack = item.getItemStack();
+                if (stack == null || stack.getType() == Material.AIR) {
+                    removeReference(item.getUniqueId(), signature, cached);
+                    continue;
+                }
+
+                Optional<ItemStack> restored = cached.createItemStack(stack);
+                if (restored.isEmpty()) {
+                    item.setItemStack(removeCacheKey(stack));
+                    removeReference(item.getUniqueId(), signature, cached);
+                    continue;
+                }
+
+                ItemStack restoredStack = restored.get();
+                item.setItemStack(restoredStack);
+                removeReference(item.getUniqueId(), signature, cached);
+                debug("Applied cached NBT to item %s (%s) for %s", item.getUniqueId(), describeItem(restoredStack),
+                        reason);
             }
         }
     }
@@ -438,8 +713,8 @@ public class NBTCacheManager {
                 return Optional.empty();
             }
 
-            int hashKey = nbtItem.getInteger(CACHE_KEY);
-            CachedEntry entry = cache.get(hashKey);
+            int signature = nbtItem.getInteger(CACHE_KEY);
+            CachedEntry entry = cache.get(signature);
             if (entry == null) {
                 nbtItem.removeKey(CACHE_KEY);
                 return Optional.of(nbtItem.getItem());
@@ -463,8 +738,8 @@ public class NBTCacheManager {
                 return Optional.empty();
             }
 
-            int hashKey = nbtItem.getInteger(CACHE_KEY);
-            CachedEntry entry = cache.get(hashKey);
+            int signature = nbtItem.getInteger(CACHE_KEY);
+            CachedEntry entry = cache.get(signature);
             if (entry == null) {
                 return Optional.empty();
             }
@@ -499,40 +774,123 @@ public class NBTCacheManager {
         return base;
     }
 
+    private static int sum(String s) {
+        int cursor = 0;
+        for (int i = 0; i < s.length(); i++) {
+            int ch = s.charAt(i);
+            int shifted = cursor << 5;
+            int mixed = shifted - cursor;
+            cursor = mixed + ch;
+        }
+        return cursor;
+    }
+
+    private static void stripIdentityKeys(NBTContainer container) {
+        if (container == null) {
+            return;
+        }
+        container.removeKey("id");
+        container.removeKey("Id");
+        container.removeKey("ID");
+        container.removeKey("Count");
+    }
+
+    private ItemStack removeCacheKey(ItemStack stack) {
+        if (stack == null) {
+            return null;
+        }
+        try {
+            NBTItem nbtItem = new NBTItem(stack.clone());
+            nbtItem.removeKey(CACHE_KEY);
+            return nbtItem.getItem();
+        } catch (Exception ex) {
+            return stack;
+        }
+    }
+
+    private static <T> Set<T> createConcurrentSet() {
+        ConcurrentMap<T, Boolean> backing = new ConcurrentHashMap<>();
+        return Collections.newSetFromMap(backing);
+    }
+
+    private static final class ItemSpawnRequest {
+        private final UUID entityId;
+        private final ItemStack snapshot;
+        private final boolean hasLore;
+        private final boolean shulker;
+        private final String description;
+
+        private ItemSpawnRequest(UUID entityId, ItemStack snapshot, boolean hasLore, boolean shulker,
+                String description) {
+            this.entityId = entityId;
+            this.snapshot = snapshot;
+            this.hasLore = hasLore;
+            this.shulker = shulker;
+            this.description = description;
+        }
+    }
+
+    private static final class ProcessedItem {
+        private final ItemSpawnRequest request;
+        private final String serializedSnapshot;
+        private final int signature;
+        private final boolean sanitized;
+        private final List<String> debugMessages;
+
+        private ProcessedItem(ItemSpawnRequest request, String serializedSnapshot, int signature, boolean sanitized,
+                List<String> debugMessages) {
+            this.request = request;
+            this.serializedSnapshot = serializedSnapshot;
+            this.signature = signature;
+            this.sanitized = sanitized;
+            this.debugMessages = debugMessages;
+        }
+    }
+
     private static final class CachedEntry {
         private final String nbtSnapshot;
-        private final Set<UUID> references = ConcurrentHashMap.newKeySet();
+        private final Set<UUID> references = createConcurrentSet();
+        private final AtomicLong lastTouched = new AtomicLong(System.nanoTime());
 
-        private CachedEntry(String nbtSnapshot) {
+        private CachedEntry(String nbtSnapshot, ItemStack prototype) {
             this.nbtSnapshot = nbtSnapshot;
         }
 
         private void addReference(UUID uuid) {
             references.add(uuid);
+            markAccess();
         }
 
         private void removeReference(UUID uuid) {
             references.remove(uuid);
+            markAccess();
         }
 
         private Optional<ItemStack> createItemStack(ItemStack baseTemplate) {
+            if (baseTemplate == null) {
+                return Optional.empty();
+            }
             try {
                 NBTContainer container = new NBTContainer(nbtSnapshot);
+                stripIdentityKeys(container);
                 ItemStack base = baseTemplate.clone();
                 NBTItem reconstructed = new NBTItem(base);
                 reconstructed.mergeCompound(container);
                 reconstructed.removeKey(CACHE_KEY);
                 ItemStack stack = reconstructed.getItem();
-                stack.setType(baseTemplate.getType());
-                stack.setAmount(baseTemplate.getAmount());
+                markAccess();
                 return Optional.of(stack);
             } catch (Exception ex) {
                 return Optional.empty();
             }
         }
 
-        private boolean isOrphaned() {
-            return references.isEmpty();
+        private void markAccess() {
+            lastTouched.set(System.nanoTime());
+        }
+
+        private boolean readyForCleanup(long cutoffNanos) {
+            return references.isEmpty() && lastTouched.get() < cutoffNanos;
         }
     }
 }
